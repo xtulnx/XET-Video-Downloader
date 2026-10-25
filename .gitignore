@@ -28,7 +28,6 @@ env/
 
 # uv
 .uv/
-uv.lock
 
 # Playwright
 browser_session/
@@ -47,6 +46,8 @@ docs/
 
 # 捕获的信息文件
 captured_videos.json
+capture_sessions/
+.test-artifacts/
 urls.txt
 
 # IDE

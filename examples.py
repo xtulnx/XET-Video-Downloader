@@ -94,7 +94,9 @@ def example_custom_output():
     # 自定义输出目录
     downloader = VideoDownloader(
         user_data_dir="./my_browser_data",
-        output_dir="./my_videos"
+        output_dir="./my_videos",
+        fragment_concurrency=10,
+        memory_cache_mib=256,  # 0 使用原生磁盘分片；默认连续数据每 8 MiB 或 3 秒提交
     )
     
     if not downloader.check_dependencies():
@@ -103,6 +105,28 @@ def example_custom_output():
     urls = ["https://appezrn4igg1968.h5.xet.citv.cn/p/course/video/v_xxx"]
     
     downloader.capture_video_urls(urls, headless=True)
+    downloader.download_all()
+
+
+def example_interactive_capture():
+    """自由浏览、收集多个标签页中的视频，结束后批量下载。"""
+    downloader = VideoDownloader()
+    if not downloader.check_dependencies():
+        return
+    downloader.capture_interactive()  # 也可以传入课程首页 URL
+    downloader.show_captured_videos()
+    # 自动快照路径：downloader.last_capture_file
+    downloader.download_all()
+
+
+def example_resume_capture():
+    """复用一次采集记录；签名地址过期时需重新浏览采集。"""
+    downloader = VideoDownloader()
+    if not downloader.check_dependencies():
+        return
+    filename = input("输入 capture_sessions 中的 videos.json 路径: ").strip()
+    downloader.load_captured_info(filename)
+    downloader.show_captured_videos()
     downloader.download_all()
 
 
@@ -115,9 +139,11 @@ if __name__ == "__main__":
     print("2. 批量下载多个视频")
     print("3. 仅捕获视频信息")
     print("4. 自定义输出目录")
+    print("5. 浏览器自由嗅探并下载")
+    print("6. 复用采集记录下载")
     print()
     
-    choice = input("请输入选项 (1-4): ").strip()
+    choice = input("请输入选项 (1-6): ").strip()
     
     if choice == "1":
         example_single_video()
@@ -127,6 +153,10 @@ if __name__ == "__main__":
         example_capture_only()
     elif choice == "4":
         example_custom_output()
+    elif choice == "5":
+        example_interactive_capture()
+    elif choice == "6":
+        example_resume_capture()
     else:
         print("无效选项")
 

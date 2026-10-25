@@ -5,8 +5,11 @@ description = "小鹅通视频批量下载工具 - 使用 Playwright 捕获 m3u8
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "imageio-ffmpeg>=0.6.0",
     "playwright>=1.40.0",
+    "psutil>=7",
     "rich>=13.7.0",
+    "yt-dlp[default]==2026.10.21",
 ]
 
 [build-system]
@@ -15,7 +18,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["main.py", "examples.py"]
+only-include = ["main.py", "capture.py", "examples.py", "memory_hls.py", "download_worker.py", "runtime_tools.py"]
 
 [dependency-groups]
 dev = []

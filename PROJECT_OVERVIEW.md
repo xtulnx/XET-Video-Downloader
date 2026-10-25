@@ -14,7 +14,9 @@
 - 使用 Playwright 模拟浏览器访问
 - 实时拦截网络请求
 - 自动识别 m3u8 视频地址
-- 优先捕获最高清晰度版本
+- 浏览器自由嗅探，覆盖本次会话内的标签页、弹窗和 iframe
+- HLS 主/子列表归并、已知签名参数去重，兼容直接 MP4
+- 优先下载主列表；仅有小鹅通子列表时优先保留 f421220
 
 ### 2. 批量下载
 - 支持单个或多个 URL
@@ -46,6 +48,9 @@ fetch-video/
 │   │   └── show_captured_videos()     # 显示视频列表
 │   └── main()                # 主入口函数
 │
+├── capture.py               # 媒体识别、去重、事件采集与快照
+├── tests/test_capture.py     # 单元测试和本地浏览器/下载集成测试
+├── capture_sessions/        # 自动保存的采集记录（不提交 Git）
 ├── pyproject.toml            # uv 项目配置
 │   ├── 项目元数据
 │   ├── 依赖声明
@@ -110,29 +115,19 @@ fetch-video/
 
 ## 🛠️ 核心技术实现
 
-### Playwright 请求拦截
+### Playwright 会话监听
 
-```python
-def handle_request(request):
-    url = request.url
-    if ".m3u8" in url and "sign=" in url:
-        if "v.f421220" in url:  # 最高清版本
-            # 捕获视频信息
-            self.captured_urls.append({...})
-```
+`BrowserCapture` 在 BrowserContext 层监听 request、response、requestfinished 等事件，覆盖新标签页、弹窗和 iframe。回调将响应入队，主循环持续派发并处理事件，读取来源标题、媒体类型和播放列表内容。
 
-### yt-dlp 下载调用
+`MediaRegistry` 保留完整签名 URL 用于下载，以独立身份键去重；解析主列表中的子列表和音轨关系，避免同一个视频重复下载，也过滤媒体分片。每次变更原子保存 JSON 和 Cookie，便于中断后复用。
 
-```python
-cmd = [
-    "yt-dlp",
-    "--referer", referer,              # 必需的 Referer
-    "--concurrent-fragments", "5",     # 并发下载
-    "-o", output_template,             # 输出模板
-    media_url                          # m3u8 地址
-]
-subprocess.run(cmd, check=True)
-```
+自由嗅探使用非阻塞终端输入，按回车、Ctrl+C 或关闭浏览器后进入既有下载流程。URL 列表模式继续保留，共用同一采集器。
+
+### 下载与内存缓存
+
+主程序使用当前 Python 启动 `download_worker.py`，在独立进程中接入固定版本的 yt-dlp 和 `MemoryHlsFD`。`memory_hls.py` 复用 HLS 列表解析、鉴权和解密，限制同时在途/等待写入的分片数和每片字节数，按顺序追加并批量提交。
+
+默认并发 10、缓存预算 256 MiB（不超过可用内存 1/8）、提交阈值 8 MiB 或 3 秒。提交时先同步数据再原子保存索引与偏移；恢复校验列表指纹并回滚未提交尾部。超大分片或已有原生续传文件回退磁盘分片，缺片不跳过。直接 MP4 仍使用 yt-dlp 原有下载器。
 
 ### 持久化会话
 
@@ -149,15 +144,17 @@ context = p.chromium.launch_persistent_context(
 ### Python 依赖
 - `playwright>=1.40.0` - 浏览器自动化
 - `rich>=13.7.0` - 终端美化
+- `yt-dlp[default]==2026.10.21` - 解析和下载（固定内部接口版本）
+- `imageio-ffmpeg>=0.6.0` - FFmpeg 二进制
+- `psutil>=7` - 系统可用内存检测
 
-### 系统依赖
-- `yt-dlp` - 视频下载核心
-- `ffmpeg` - 视频处理（可选但推荐）
+### 安装方式
+所有上述依赖使用 `uv sync --locked` 安装，`uv.lock` 纳入版本管理；浏览器驱动使用 `uv run playwright install chromium` 安装。特殊平台可用 `IMAGEIO_FFMPEG_EXE` 指定 FFmpeg。
 
 ## 🚀 使用场景
 
 ### 场景 1: 购买的课程批量下载
-- 整理课程 URL 列表
+- 自由浏览并播放课程，或使用现有 URL 列表
 - 一次性下载所有视频
 - 本地观看学习
 
@@ -270,5 +267,5 @@ MIT License - 自由使用和修改
 ---
 
 **项目创建日期**: 2026-01-01  
-**最后更新**: 2026-01-01
+**最后更新**: 2026-10-25
 

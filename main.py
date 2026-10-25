@@ -6,14 +6,18 @@
 
 import subprocess
 import re
-import os
 import sys
 import json
+import time
 from pathlib import Path
-from typing import List, Dict, Optional
-from playwright.sync_api import sync_playwright, Page, BrowserContext
+from typing import List, Dict, Any
+from datetime import datetime
+from uuid import uuid4
+from urllib.parse import urlsplit
+from playwright.sync_api import sync_playwright, Error as PlaywrightError
+from capture import BrowserCapture, StopInput, media_key, video_id, save_records
+from runtime_tools import ffmpeg_executable
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 
@@ -23,138 +27,156 @@ console = Console()
 class VideoDownloader:
     """视频下载器主类"""
     
-    def __init__(self, user_data_dir: str = "./browser_session", output_dir: str = "./downloads"):
+    def __init__(self, user_data_dir: str = "./browser_session", output_dir: str = "./downloads",
+                 fragment_concurrency: int = 10, memory_cache_mib: int = 256):
         self.user_data_dir = Path(user_data_dir)
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.captured_urls: List[Dict[str, str]] = []
+        self.output_dir = Path(output_dir).expanduser()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.captured_urls: List[Dict[str, Any]] = []
+        self.last_capture_file = None
+        if not 1 <= fragment_concurrency <= 32 or memory_cache_mib < 0:
+            raise ValueError("并发数必须为 1～32，缓存 MiB 必须大于等于 0")
+        self.fragment_concurrency = fragment_concurrency
+        self.memory_cache_mib = memory_cache_mib
         
     def check_dependencies(self) -> bool:
         """检查系统依赖是否安装"""
         console.print("\n[bold cyan]🔍 检查系统依赖...[/bold cyan]")
         
-        # 检查 yt-dlp
         try:
-            result = subprocess.run(
-                ["yt-dlp", "--version"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            console.print(f"[green]✓[/green] yt-dlp 已安装 (版本: {result.stdout.strip()})")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            console.print("[red]✗[/red] 未检测到 yt-dlp，请先安装:")
-            console.print("  [yellow]brew install yt-dlp[/yellow]  (macOS)")
-            console.print("  [yellow]pip install yt-dlp[/yellow]   (通用)")
+            from yt_dlp.version import __version__
+            console.print(f"[green]✓[/green] uv 环境中的 yt-dlp: {__version__}")
+            executable = ffmpeg_executable()
+            result = subprocess.run([executable, "-version"], capture_output=True, text=True, check=True)
+            console.print(f"[green]✓[/green] FFmpeg: {result.stdout.splitlines()[0]}")
+        except (ImportError, RuntimeError, OSError, subprocess.CalledProcessError) as error:
+            console.print(f"依赖不可用: {error}", style="red", markup=False)
+            console.print("[yellow]请先执行 uv sync，再用 uv run python main.py 启动。[/yellow]")
             return False
-            
-        # 检查 ffmpeg
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            version_line = result.stdout.split('\n')[0]
-            console.print(f"[green]✓[/green] ffmpeg 已安装 ({version_line})")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            console.print("[yellow]⚠[/yellow] 未检测到 ffmpeg，建议安装以获得更好的体验:")
-            console.print("  [yellow]brew install ffmpeg[/yellow]  (macOS)")
-            
         return True
     
-    def setup_request_handler(self, page: Page):
-        """设置请求拦截处理器"""
-        def handle_request(request):
-            url = request.url
-            # 匹配小鹅通的 M3U8 签名链接
-            if ".m3u8" in url and "sign=" in url:
-                # 优先捕获高清版本 (f421220)
-                if "v.f421220" in url:
-                    referer = request.headers.get("referer", "")
-                    page_url = page.url
-                    
-                    # 避免重复添加
-                    if not any(item['media_url'] == url for item in self.captured_urls):
-                        self.captured_urls.append({
-                            'media_url': url,
-                            'referer': referer,
-                            'page_url': page_url,
-                            'title': page.title() or "未知标题"
-                        })
-                        console.print(f"[green]✓[/green] 捕获到视频: [cyan]{page.title()}[/cyan]")
-        
-        page.on("request", handle_request)
-    
-    def capture_video_urls(self, urls: List[str], headless: bool = False, wait_time: int = 10) -> List[Dict[str, str]]:
-        """
-        捕获视频地址
-        
-        Args:
-            urls: 视频页面URL列表
-            headless: 是否使用无头模式
-            wait_time: 每个页面等待时间（秒），首次登录建议30秒以上
-            
-        Returns:
-            捕获到的视频信息列表
-        """
-        console.print(f"\n[bold cyan]🎬 开始捕获视频地址...[/bold cyan]")
-        console.print(f"[dim]待处理URL数量: {len(urls)}[/dim]")
-        
-        with sync_playwright() as p:
-            # 使用持久化上下文保存登录状态，使用 Edge 浏览器
-            # 如果想用 Chrome，改为 p.chromium; 用 Firefox 改为 p.firefox
+    def _launch_browser(self, playwright, headless=False):
+        options = dict(user_data_dir=str(self.user_data_dir), headless=headless,
+                       viewport={"width": 1280, "height": 720})
+        try:
+            return playwright.chromium.launch_persistent_context(channel="msedge", **options)
+        except PlaywrightError:
+            console.print("[yellow]无法启动 Edge，尝试 Chromium。[/yellow]")
+            return playwright.chromium.launch_persistent_context(**options)
+
+    def _start_capture(self, context):
+        self.captured_urls.clear()
+        session = Path("capture_sessions") / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8])
+        self.last_capture_file = session.resolve() / "videos.json"
+        capture = BrowserCapture(context, self.captured_urls, session,
+                                 lambda message: console.print(message, style="green", markup=False))
+        capture.persist()
+        console.print(f"[dim]采集记录自动保存到: {self.last_capture_file}[/dim]")
+        return capture
+
+    def _finish_capture(self, context, capture):
+        try:
+            capture.drain()
+            capture.persist()
+        finally:
+            capture.detach()
             try:
-                # 尝试使用系统安装的 Edge 浏览器
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=str(self.user_data_dir),
-                    headless=headless,
-                    channel='msedge',  # 使用 Microsoft Edge
-                    args=['--no-sandbox'],
-                    viewport={'width': 1280, 'height': 720}
-                )
-            except Exception as e:
-                console.print(f"[yellow]⚠[/yellow] 无法启动 Edge 浏览器，尝试使用 Chromium: {e}")
-                # 如果 Edge 不可用，回退到 Chromium
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=str(self.user_data_dir),
-                    headless=headless,
-                    args=['--no-sandbox'],
-                    viewport={'width': 1280, 'height': 720}
-                )
-            
-            page = context.new_page()
-            self.setup_request_handler(page)
-            
-            for idx, url in enumerate(urls, 1):
-                try:
-                    console.print(f"\n[bold]处理 [{idx}/{len(urls)}][/bold]: {url}")
-                    page.goto(url, wait_until="networkidle", timeout=60000)
-                    
-                    # 等待视频加载
-                    console.print(f"[dim]等待视频加载（{wait_time}秒）...[/dim]")
-                    page.wait_for_timeout(wait_time * 1000)
-                    
-                    # 尝试点击播放按钮（如果存在）
+                context.close()
+            except PlaywrightError:
+                pass
+
+    def _wait_for_capture(self, page, capture, seconds):
+        deadline = time.monotonic() + seconds
+        while not capture.closed and time.monotonic() < deadline:
+            page.wait_for_timeout(min(200, max(0, (deadline - time.monotonic()) * 1000)))
+            capture.drain()
+
+    def capture_video_urls(self, urls: List[str], headless: bool = False, wait_time: int = 10):
+        """按预先提供的页面列表采集，同样监听该会话内的新标签页。"""
+        console.print(f"\n[bold cyan]🎬 开始捕获 {len(urls)} 个页面的视频...[/bold cyan]")
+        with sync_playwright() as playwright:
+            context = self._launch_browser(playwright, headless)
+            capture = self._start_capture(context)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                for index, url in enumerate(urls, 1):
+                    if capture.closed:
+                        break
+                    console.print(f"处理 [{index}/{len(urls)}]: {url}", markup=False)
                     try:
-                        play_button = page.locator('button[class*="play"], div[class*="play"]').first
-                        if play_button.is_visible(timeout=2000):
-                            play_button.click()
-                            console.print("[dim]已点击播放按钮[/dim]")
-                            page.wait_for_timeout(5000)
-                    except:
-                        pass
-                    
-                except Exception as e:
-                    console.print(f"[red]✗[/red] 处理失败: {str(e)}")
-                    continue
-            
-            context.close()
-        
+                        # 长连接和视频分片会使 networkidle 一直无法满足。
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        self._wait_for_capture(page, capture, max(0, wait_time))
+                        capture.drain()
+                        button = page.locator('button[class*="play"], div[class*="play"]').first
+                        if button.is_visible():
+                            button.click(timeout=2000)
+                            self._wait_for_capture(page, capture, 5)
+                        capture.drain()
+                    except PlaywrightError as error:
+                        console.print(f"页面处理未完成: {error}", style="yellow", markup=False)
+            except KeyboardInterrupt:
+                console.print("\n[yellow]已结束采集，保留已捕获的视频。[/yellow]")
+            finally:
+                self._finish_capture(context, capture)
         return self.captured_urls
-    
-    def download_video(self, video_info: Dict[str, str], index: int) -> bool:
+
+    def capture_interactive(self, start_url: str = ""):
+        """用户自由浏览；回车、Ctrl+C 或关闭全部浏览器窗口结束采集。"""
+        if start_url and urlsplit(start_url).scheme not in {"http", "https"}:
+            raise ValueError("起始地址必须是 http:// 或 https:// URL")
+        console.print("\n[bold cyan]在浏览器中登录、浏览课程并点击播放，可打开多个标签页。[/bold cyan]")
+        console.print("[cyan]终端按回车、Ctrl+C 或关闭全部浏览器窗口结束采集，然后选择是否下载。[/cyan]")
+        stop_input = StopInput()
+        with sync_playwright() as playwright:
+            context = self._launch_browser(playwright, headless=False)
+            capture = self._start_capture(context)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                if start_url:
+                    try:
+                        page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+                    except PlaywrightError:
+                        console.print("[yellow]起始页未加载完成，可在浏览器中继续手动访问。[/yellow]")
+                while not capture.closed and context.pages:
+                    capture.drain()
+                    if stop_input.requested():
+                        break
+                    if capture.closed or not context.pages:
+                        break
+                    try:
+                        # 必须让 Playwright 继续派发事件，不能用 input()/time.sleep() 阻塞。
+                        context.pages[0].wait_for_timeout(200)
+                    except PlaywrightError:
+                        if capture.closed or not context.pages:
+                            break
+            except KeyboardInterrupt:
+                console.print("\n[yellow]已结束采集，保留已捕获的视频。[/yellow]")
+            finally:
+                self._finish_capture(context, capture)
+        return self.captured_urls
+
+    def load_captured_info(self, filename: str):
+        """复用自动快照或旧版导出的 JSON（签名链接仍需有效）。"""
+        path = Path(filename)
+        with path.open(encoding="utf-8") as stream:
+            records = json.load(stream)
+        if not isinstance(records, list):
+            raise ValueError("采集记录必须是 JSON 数组")
+        for record in records:
+            if not isinstance(record, dict) or not all(isinstance(record.get(k), str)
+                    for k in ("media_url", "title", "referer", "page_url")):
+                raise ValueError("采集记录缺少 media_url/title/referer/page_url 字段")
+            if urlsplit(record["media_url"]).scheme not in {"http", "https"}:
+                raise ValueError("媒体地址必须是 HTTP(S) URL")
+            if not isinstance(record.get("headers", {}), dict):
+                raise ValueError("headers 必须是对象")
+            record["video_id"] = video_id(media_key(record["media_url"])) if not re.fullmatch(
+                r"[a-f0-9]{12}", str(record.get("video_id", ""))) else record["video_id"]
+        self.captured_urls = records
+        return records
+
+    def download_video(self, video_info: Dict[str, Any], index: int) -> bool:
         """
         下载单个视频
         
@@ -171,28 +193,38 @@ class VideoDownloader:
         
         # 清理文件名，移除非法字符
         safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)
-        # 只使用标题作为文件名，不加序号前缀
-        output_template = str(self.output_dir / f"{safe_title}.%(ext)s")
+        safe_title = re.sub(r'[\x00-\x1f]', '_', safe_title).strip(" .")
+        safe_title = safe_title.encode("utf-8")[:180].decode("utf-8", errors="ignore") or "未知标题"
+        identity = video_info.get("video_id") or video_id(media_key(media_url))
+        # 字面量 % 必须转义，避免标题被 yt-dlp 当作输出模板字段。
+        basename = f"{safe_title}_{identity}"
+        output_template = str(self.output_dir / basename).replace("%", "%%") + ".%(ext)s"
         
         console.print(f"\n[bold cyan]⬇️  下载视频:[/bold cyan] {title}")
         console.print(f"[dim]输出路径: {output_template}[/dim]")
         
         cmd = [
-            "yt-dlp",
+            sys.executable, str(Path(__file__).with_name("download_worker.py")),
             "--referer", referer,
-            "--concurrent-fragments", "5",
-            "--progress",
+            "--concurrent-fragments", str(self.fragment_concurrency),
+            "--memory-mib", str(self.memory_cache_mib),
             "-o", output_template,
             media_url
         ]
         
+        cookie_file = video_info.get("cookies_file")
+        if cookie_file and Path(cookie_file).is_file():
+            cmd[2:2] = ["--cookies", str(cookie_file)]
+        for header, value in video_info.get("headers", {}).items():
+            if header.lower() in {"user-agent", "origin"} and isinstance(value, str):
+                cmd[2:2] = ["--add-headers", f"{header}:{value}"]
         try:
-            result = subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True)
             console.print(f"[green]✓[/green] 下载完成: {title}")
             return True
-        except subprocess.CalledProcessError as e:
-            console.print(f"[red]✗[/red] 下载失败: {title}")
-            console.print(f"[dim]错误信息: {e}[/dim]")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            console.print(f"下载失败: {title}", style="red", markup=False)
+            console.print("[yellow]采集记录和已提交的下载进度已保留。若签名过期，请重新采集来源页面。[/yellow]")
             return False
     
     def download_all(self) -> tuple[int, int]:
@@ -243,8 +275,7 @@ class VideoDownloader:
     def save_captured_info(self, filename: str = "captured_videos.json"):
         """保存捕获的视频信息到JSON文件"""
         filepath = Path(filename)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(self.captured_urls, f, ensure_ascii=False, indent=2)
+        save_records(filepath, self.captured_urls)
         console.print(f"[green]✓[/green] 视频信息已保存到: {filepath.absolute()}")
 
 
@@ -266,56 +297,64 @@ def main():
     console.print("[bold magenta]  支持自动捕获 m3u8 地址并批量下载[/bold magenta]")
     console.print("[bold magenta]" + "=" * 60 + "[/bold magenta]\n")
     
-    downloader = VideoDownloader()
+    while True:
+        output_dir = Prompt.ask("视频输出目录", default="./downloads").strip() or "./downloads"
+        try:
+            downloader = VideoDownloader(output_dir=output_dir)
+            break
+        except (OSError, ValueError, RuntimeError) as error:
+            console.print(f"无法创建输出目录，请重新输入: {error}", style="red", markup=False)
+    console.print(f"视频将保存到: {downloader.output_dir.resolve()}", style="cyan", markup=False)
     
     # 检查依赖
     if not downloader.check_dependencies():
         console.print("\n[red]请先安装必要的依赖，然后重新运行程序[/red]")
         sys.exit(1)
     
-    # 获取URL列表
-    console.print("\n[bold cyan]📝 请输入视频URL[/bold cyan]")
-    console.print("选项:")
-    console.print("  1. 手动输入URL（多个URL用逗号或换行分隔）")
-    console.print("  2. 从文件读取URL列表")
-    
-    choice = Prompt.ask("请选择", choices=["1", "2"], default="1")
-    
-    urls = []
-    if choice == "1":
-        url_input = Prompt.ask("\n请输入URL")
-        # 支持逗号或换行分隔
-        urls = [u.strip() for u in re.split(r'[,\n]+', url_input) if u.strip()]
-    else:
-        filepath = Prompt.ask("请输入文件路径", default="urls.txt")
+    console.print("\n[bold cyan]📝 选择视频来源[/bold cyan]")
+    console.print("  1. 手动输入 URL（多个用逗号分隔）")
+    console.print("  2. 从文件读取 URL 列表")
+    console.print("  3. 打开浏览器，自由浏览并收集视频")
+    console.print("  4. 读取已保存的采集记录，继续下载")
+    choice = Prompt.ask("请选择", choices=["1", "2", "3", "4"], default="1")
+
+    if choice == "3":
+        start_url = Prompt.ask("起始页面 URL（留空后在浏览器中手动访问）", default="").strip()
+        captured = downloader.capture_interactive(start_url)
+    elif choice == "4":
+        filepath = Prompt.ask("采集 JSON 文件路径", default="captured_videos.json")
         try:
-            urls = load_urls_from_file(filepath)
-        except FileNotFoundError:
-            console.print(f"[red]✗[/red] 文件不存在: {filepath}")
-            sys.exit(1)
-    
-    if not urls:
-        console.print("[red]✗[/red] 没有输入任何URL")
-        sys.exit(1)
-    
-    console.print(f"[green]✓[/green] 已加载 {len(urls)} 个URL")
-    
-    # 询问是否使用无头模式
-    headless = not Confirm.ask("\n是否显示浏览器窗口？（首次运行建议显示以完成登录）", default=True)
-    
-    # 询问等待时间
-    if not headless:
-        console.print("\n[cyan]💡 提示：首次登录需要扫码，建议设置较长等待时间（如30-60秒）[/cyan]")
-    wait_time_str = Prompt.ask("每个页面等待时间（秒）", default="30" if not headless else "10")
-    try:
-        wait_time = int(wait_time_str)
-    except ValueError:
-        wait_time = 30 if not headless else 10
-        console.print(f"[yellow]输入无效，使用默认值: {wait_time}秒[/yellow]")
-    
-    # 捕获视频地址
-    captured = downloader.capture_video_urls(urls, headless=headless, wait_time=wait_time)
-    
+            captured = downloader.load_captured_info(filepath)
+        except (OSError, ValueError) as error:
+            console.print(f"无法读取采集记录: {error}", style="red", markup=False)
+            return
+        console.print("[dim]复用保存的地址；若签名已过期，需要重新浏览并采集。[/dim]")
+    else:
+        if choice == "1":
+            url_input = Prompt.ask("请输入 URL")
+            urls = [u.strip() for u in re.split(r'[,\n]+', url_input) if u.strip()]
+        else:
+            filepath = Prompt.ask("请输入文件路径", default="urls.txt")
+            try:
+                urls = load_urls_from_file(filepath)
+            except OSError as error:
+                console.print(f"无法读取 URL 文件: {error}", style="red", markup=False)
+                return
+        if not urls:
+            console.print("[red]没有输入任何 URL[/red]")
+            return
+        headless = not Confirm.ask("是否显示浏览器窗口？（首次运行建议显示以完成登录）", default=True)
+        default_wait = 10 if headless else 30
+        wait_time_str = Prompt.ask("每个页面等待时间（秒）", default=str(default_wait))
+        try:
+            wait_time = int(wait_time_str)
+            if wait_time < 0:
+                raise ValueError
+        except ValueError:
+            wait_time = default_wait
+            console.print(f"[yellow]输入无效，使用默认值: {wait_time} 秒[/yellow]")
+        captured = downloader.capture_video_urls(urls, headless=headless, wait_time=wait_time)
+
     if not captured:
         console.print("\n[yellow]⚠[/yellow] 未能捕获到任何视频地址")
         console.print("可能的原因:")
@@ -331,8 +370,21 @@ def main():
     if Confirm.ask("\n是否保存捕获的视频信息到JSON文件？", default=True):
         downloader.save_captured_info()
     
+    # 下载设置同时适用于自由嗅探和历史记录复用。
+    def ask_integer(label, default, minimum, maximum):
+        while True:
+            try:
+                value = int(Prompt.ask(label, default=str(default)))
+                if minimum <= value <= maximum:
+                    return value
+            except ValueError:
+                pass
+            console.print(f"[yellow]请输入 {minimum}～{maximum} 之间的整数。[/yellow]")
+
     # 询问是否开始下载
     if Confirm.ask("\n是否开始下载视频？", default=True):
+        downloader.fragment_concurrency = ask_integer("分片并发数", 10, 1, 32)
+        downloader.memory_cache_mib = ask_integer("分片缓存上限（MiB，0 使用磁盘分片）", 256, 0, 4096)
         success, fail = downloader.download_all()
         
         # 显示下载结果
